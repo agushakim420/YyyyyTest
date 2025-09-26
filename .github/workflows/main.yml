@@ -1,0 +1,435 @@
+name: Build KernelSU Next Extended for HyperOS 2
+
+on:
+  workflow_dispatch:
+    inputs:
+      ANDROID_VERSION:
+        description: 'Android Version'
+        required: true
+        default: '14'
+        type: choice
+        options:
+        - '14'
+        - '13'
+      KSU_VERSION:
+        description: 'KernelSU Version'
+        required: true
+        default: 'next'
+        type: choice
+        options:
+        - next
+        - main
+      CLEAN_BUILD:
+        description: 'Clean Build'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Build Environment
+      run: |
+        echo "=== Installing dependencies for Android ${{ github.event.inputs.ANDROID_VERSION }} ==="
+        sudo apt-get update
+        sudo apt-get install -y \
+          bc bison build-essential ccache curl flex g++-multilib \
+          gcc-multilib git gnupg gperf imagemagick lib32ncurses5-dev \
+          lib32readline-dev lib32z1-dev liblz4-tool libncurses5 \
+          libncurses5-dev libsdl1.2-dev libssl-dev libxml2 \
+          libxml2-utils lzop pngcrush rsync schedtool squashfs-tools \
+          xsltproc zip zlib1g-dev python3 python-is-python3 perl \
+          libelf-dev cpio
+
+    - name: Setup Toolchain for Extended Kernel
+      run: |
+        echo "=== Setting up Android Clang 12.0.5 (matching your kernel) ==="
+        
+        # Download exact same clang version as your current kernel
+        mkdir -p ~/toolchain
+        cd ~/toolchain
+        
+        # Android Clang r416183b (matching your kernel exactly)
+        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz
+        mkdir clang && cd clang
+        tar -xzf ../clang-r416183b.tar.gz
+        
+        # Backup: Use Proton Clang if above fails
+        if [ ! -f "bin/clang" ]; then
+          cd ~/toolchain
+          rm -rf clang
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
+        fi
+        
+        # Get GCC for cross compile
+        cd ~/toolchain
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 gcc64
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 gcc32
+
+    - name: Clone Extended Kernel Source
+      run: |
+        echo "=== Cloning Extended kernel source ==="
+        git clone --depth=1 https://github.com/fernandobouchet/Whyred -b extended kernel
+        
+        cd kernel
+        echo "Kernel commit: $(git rev-parse HEAD)"
+
+    - name: Apply Android 14 Compatibility Patches
+      run: |
+        cd kernel
+        
+        echo "=== Applying Android 14 compatibility patches ==="
+        
+        # Patch 1: Update kernel config for Android 14
+        cat >> arch/arm64/configs/whyred_defconfig << 'EOL'
+        
+        # Android 14 Requirements
+        CONFIG_ANDROID_KABI_RESERVE=y
+        CONFIG_ANDROID_VENDOR_HOOKS=y
+        CONFIG_EXT4_FS_POSIX_ACL=y
+        CONFIG_F2FS_FS_POSIX_ACL=y
+        CONFIG_INCREMENTAL_FS=y
+        CONFIG_BPF_JIT=y
+        CONFIG_BPF_JIT_ALWAYS_ON=y
+        CONFIG_USERFAULTFD=y
+        CONFIG_UNICODE=y
+        
+        # Security for Android 14
+        CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y
+        CONFIG_INIT_ON_FREE_DEFAULT_ON=y
+        CONFIG_HARDENED_USERCOPY=y
+        CONFIG_HARDENED_USERCOPY_FALLBACK=y
+        CONFIG_FORTIFY_SOURCE=y
+        CONFIG_SECURITY_SELINUX_DEVELOP=y
+        
+        # Extended kernel specific
+        CONFIG_EXTENDED_KERNEL=y
+        CONFIG_EXTENDED_MODULES=y
+        EOL
+        
+        # Patch 2: Fix potential build issues with newer Android
+        if [ -f "scripts/gcc-version.sh" ]; then
+          sed -i 's/\$compiler -dumpversion/\$compiler -dumpfullversion/g' scripts/gcc-version.sh
+        fi
+
+    - name: Setup KernelSU Next with Extended Support
+      run: |
+        cd kernel
+        
+        echo "=== Integrating KernelSU Next for Extended kernel ==="
+        
+        # Setup KernelSU Next
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.KSU_VERSION || 'next' }}
+        
+        # Apply Extended kernel compatibility patch for KSU
+        if [ -d "KernelSU" ]; then
+          echo "✓ KernelSU integrated, applying Extended patches..."
+          
+          # Create compatibility patch
+          cat > ksu_extended.patch << 'EOF'
+        --- a/kernel/Makefile
+        +++ b/kernel/Makefile
+        @@ -1,6 +1,7 @@
+         # Extended Kernel KSU Compatibility
+         obj-y += KernelSU/kernel/
+         ccflags-y += -I$(srctree)/KernelSU/kernel/include
+        +ccflags-y += -DCONFIG_EXTENDED_KERNEL
+         
+        EOF
+          
+          # Try to apply patch
+          patch -p1 < ksu_extended.patch || echo "Patch might already be applied"
+        fi
+        
+        # Verify KSU integration
+        if [ -d "KernelSU" ]; then
+          echo "KernelSU version:"
+          cd KernelSU && git log --oneline -1 && cd ..
+        fi
+
+    - name: Configure Kernel for HyperOS 2
+      run: |
+        cd kernel
+        
+        # Setup environment
+        export PATH="$HOME/toolchain/clang/bin:$HOME/toolchain/gcc64/bin:$HOME/toolchain/gcc32/bin:$PATH"
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export KBUILD_BUILD_USER="KSU-Extended"
+        export KBUILD_BUILD_HOST="HyperOS2"
+        
+        # Clean if requested
+        if [ "${{ github.event.inputs.CLEAN_BUILD }}" = "true" ]; then
+          make O=out clean
+          make O=out mrproper
+        fi
+        
+        # Load Extended defconfig
+        make O=out ARCH=arm64 whyred_defconfig
+        
+        # Enable KernelSU
+        ./scripts/config --file out/.config \
+          --enable CONFIG_KSU \
+          --enable CONFIG_OVERLAY_FS \
+          --enable CONFIG_MODULES \
+          --enable CONFIG_MODULE_UNLOAD \
+          --enable CONFIG_MODULE_FORCE_UNLOAD
+        
+        # Android 14 specific configs
+        if [ "${{ github.event.inputs.ANDROID_VERSION }}" = "14" ]; then
+          ./scripts/config --file out/.config \
+            --enable CONFIG_ANDROID_BINDERFS \
+            --enable CONFIG_ANDROID_BINDER_IPC \
+            --set-str CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder"
+        fi
+        
+        # Regenerate config
+        make O=out ARCH=arm64 olddefconfig
+
+    - name: Build Extended Kernel with KSU Next
+      run: |
+        cd kernel
+        
+        # Setup environment (matching your kernel build)
+        export PATH="$HOME/toolchain/clang/bin:$HOME/toolchain/gcc64/bin:$HOME/toolchain/gcc32/bin:$PATH"
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export KBUILD_BUILD_USER="KSU-Extended"
+        export KBUILD_BUILD_HOST="HyperOS2"
+        
+        # Build info
+        echo "=== Build Information ==="
+        echo "Clang version: $(clang --version | head -1)"
+        echo "Building for Android: ${{ github.event.inputs.ANDROID_VERSION }}"
+        echo "KernelSU: ${{ github.event.inputs.KSU_VERSION }}"
+        
+        START=$(date +"%s")
+        
+        # Build kernel (matching your kernel's build command)
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-android- \
+          CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          OBJCOPY=llvm-objcopy \
+          OBJDUMP=llvm-objdump \
+          STRIP=llvm-strip \
+          2>&1 | tee build.log
+        
+        END=$(date +"%s")
+        DIFF=$((END - START))
+        echo "Build time: $((DIFF / 60))m $((DIFF % 60))s"
+
+    - name: Verify Build
+      run: |
+        cd kernel
+        
+        if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+          echo "✓ Kernel built successfully!"
+          echo "Kernel info:"
+          ls -lh out/arch/arm64/boot/Image.gz-dtb
+          strings out/arch/arm64/boot/Image.gz-dtb | grep -i "extended" | head -5
+        else
+          echo "✗ Build failed!"
+          echo "Last 50 lines of build log:"
+          tail -50 build.log
+          exit 1
+        fi
+
+    - name: Create AnyKernel3 Package for HyperOS 2
+      run: |
+        echo "=== Creating HyperOS 2 compatible flashable zip ==="
+        
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3
+        cd AnyKernel3
+        
+        # Clean unnecessary files
+        rm -rf .git* README.md LICENSE
+        
+        # Configure for HyperOS 2 Extended
+        cat > anykernel.sh << 'EOL'
+        # AnyKernel3 Ramdisk Mod Script
+        # For HyperOS 2 Extended Kernel with KernelSU Next
+        
+        properties() { '
+        kernel.string=KernelSU Next Extended for HyperOS 2 (whyred)
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=whyred
+        device.name2=Redmi Note 5
+        device.name3=Redmi Note 5 Pro
+        supported.versions=14
+        supported.patchlevels=
+        '; }
+        
+        # Shell variables
+        block=/dev/block/bootdevice/by-name/boot;
+        is_slot_device=0;
+        ramdisk_compression=auto;
+        patch_vbmeta_flag=auto;
+        
+        ## AnyKernel methods
+        . tools/ak3-core.sh;
+        
+        ## AnyKernel file attributes
+        set_perm_recursive 0 0 755 644 $ramdisk/*;
+        set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin;
+        
+        ## AnyKernel install
+        dump_boot;
+        
+        # Extended kernel specific patches
+        if [ -f "$home/extended_patch.sh" ]; then
+          ui_print "- Applying Extended kernel patches..."
+          . $home/extended_patch.sh;
+        fi
+        
+        write_boot;
+        
+        ## End install
+        EOL
+        
+        # Create Extended patch script
+        cat > extended_patch.sh << 'EOL'
+        # Extended Kernel Compatibility Patches
+        # For HyperOS 2 Android 14
+        
+        # Preserve HyperOS specific properties
+        backup_file init.rc;
+        backup_file init.environ.rc;
+        
+        # Patch for Android 14 compatibility
+        if [ -f "$ramdisk/init.rc" ]; then
+          insert_line "$ramdisk/init.rc" "import /init.extended.rc" after "import /init.environ.rc" "import /init.extended.rc";
+        fi
+        
+        # Create extended init if not exists
+        if [ ! -f "$ramdisk/init.extended.rc" ]; then
+          cat > "$ramdisk/init.extended.rc" << 'INIT'
+        # Extended Kernel Init
+        on boot
+            # KernelSU Next
+            chmod 0755 /data/adb/ksu
+            
+        on property:sys.boot_completed=1
+            # Extended kernel optimizations
+            write /proc/sys/kernel/sched_boost 1
+        INIT
+        fi
+        EOL
+        
+        # Copy kernel
+        cp ../kernel/out/arch/arm64/boot/Image.gz-dtb .
+        
+        # Copy DTB/DTBO if exists
+        [ -f "../kernel/out/arch/arm64/boot/dtbo.img" ] && cp ../kernel/out/arch/arm64/boot/dtbo.img .
+        
+        # Create version info
+        cat > version.txt << EOL
+        KernelSU Next Extended Build Information
+        ========================================
+        Build Date: $(date)
+        Android Version: ${{ github.event.inputs.ANDROID_VERSION }}
+        KernelSU Version: ${{ github.event.inputs.KSU_VERSION }}
+        Kernel: 4.4.302-Extended
+        ROM: HyperOS 2
+        Device: Xiaomi Redmi Note 5 (whyred)
+        Builder: GitHub Actions
+        EOL
+        
+        # Create flashable zip
+        zip -r9 "../KSU-Next-Extended-HyperOS2-A${{ github.event.inputs.ANDROID_VERSION }}-$(date +%Y%m%d).zip" * -x '*.git*'
+        
+        cd ..
+        echo "✓ Flashable zip created!"
+        ls -lh *.zip
+
+    - name: Upload Kernel Image
+      uses: actions/upload-artifact@v3
+      with:
+        name: Extended-Kernel-Image
+        path: kernel/out/arch/arm64/boot/Image.gz-dtb
+
+    - name: Upload Flashable Zip
+      uses: actions/upload-artifact@v3
+      with:
+        name: KSU-Next-Extended-HyperOS2
+        path: KSU-Next-Extended-*.zip
+
+    - name: Upload Build Log
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: Build-Log
+        path: kernel/build.log
+
+    - name: Create Release
+      if: success()
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: KSU-Extended-A${{ github.event.inputs.ANDROID_VERSION }}-${{ github.run_number }}
+        name: KernelSU Next Extended for HyperOS 2 - Build ${{ github.run_number }}
+        body: |
+          ## KernelSU Next Extended for HyperOS 2
+          ### Xiaomi Redmi Note 5 (whyred)
+          
+          ### Build Information
+          - **Android Version:** ${{ github.event.inputs.ANDROID_VERSION }}
+          - **KernelSU Version:** ${{ github.event.inputs.KSU_VERSION }}
+          - **Kernel Base:** 4.4.302-Extended
+          - **ROM Compatibility:** HyperOS 2
+          - **Build Date:** $(date)
+          
+          ### What's Included
+          - Extended Kernel features
+          - KernelSU Next root solution
+          - Android 14 compatibility patches
+          - HyperOS 2 optimizations
+          
+          ### Installation Guide
+          1. **Requirements:**
+             - Unlocked bootloader
+             - Custom recovery (TWRP/OrangeFox)
+             - HyperOS 2 ROM installed
+          
+          2. **Installation:**
+             - Backup current boot.img
+             - Download the flashable zip
+             - Boot to recovery
+             - Flash the zip
+             - Wipe cache/dalvik
+             - Reboot
+          
+          3. **Post Installation:**
+             - Install KernelSU Manager APK
+             - Grant root access to apps as needed
+          
+          ### Important Notes
+          ⚠️ **WARNING:** This kernel is specifically built for HyperOS 2 Android 14
+          ⚠️ Do NOT flash on other ROMs or Android versions
+          ⚠️ Always backup before flashing
+          
+          ### Troubleshooting
+          If bootloop occurs:
+          - Boot to recovery
+          - Restore boot.img backup
+          - Or reflash ROM
+          
+          **Support:** Create an issue if you encounter problems
+        files: |
+          KSU-Next-Extended-*.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
