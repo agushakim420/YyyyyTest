@@ -1,3 +1,17 @@
+env:
+  TZ: Asia/Jakarta
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # Max 2 jam
+    
+    permissions:
+      contents: write
+      packages: write
+      actions: write
+
 name: Build KernelSU Next Extended for HyperOS 2
 
 on:
