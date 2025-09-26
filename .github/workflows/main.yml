@@ -1,17 +1,3 @@
-env:
-  TZ: Asia/Jakarta
-  DEBIAN_FRONTEND: noninteractive
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120  # Max 2 jam
-    
-    permissions:
-      contents: write
-      packages: write
-      actions: write
-
 name: Build KernelSU Next Extended for HyperOS 2
 
 on:
@@ -39,9 +25,19 @@ on:
         default: true
         type: boolean
 
+env:
+  TZ: Asia/Jakarta
+  DEBIAN_FRONTEND: noninteractive
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    
+    permissions:
+      contents: write
+      packages: write
+      actions: write
     
     steps:
     - name: Checkout
@@ -369,7 +365,6 @@ jobs:
         echo "✓ Flashable zip created!"
         ls -lh *.zip
 
-    # UPDATED TO V4 - FIX FOR DEPRECATED ERROR
     - name: Upload Kernel Image
       uses: actions/upload-artifact@v4
       with:
@@ -378,7 +373,6 @@ jobs:
         compression-level: 9
         retention-days: 30
 
-    # UPDATED TO V4
     - name: Upload Flashable Zip
       uses: actions/upload-artifact@v4
       with:
@@ -387,7 +381,6 @@ jobs:
         compression-level: 9
         retention-days: 30
 
-    # UPDATED TO V4
     - name: Upload Build Log
       if: always()
       uses: actions/upload-artifact@v4
@@ -397,7 +390,6 @@ jobs:
         compression-level: 9
         retention-days: 7
 
-    # UPDATED TO V2
     - name: Create Release
       if: success()
       uses: softprops/action-gh-release@v2
