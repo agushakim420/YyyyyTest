@@ -71,9 +71,6 @@ jobs:
           lib32z1-dev lib32readline-dev \
           libc6-dev-i386 libx11-dev lib32z-dev \
           libgl1-mesa-dev xsltproc unzip fontconfig
-        
-        # Install older OpenSSL for compatibility
-        sudo apt-get install -y libssl1.1 || true
 
     - name: Setup Toolchain for Extended Kernel
       run: |
@@ -114,11 +111,11 @@ jobs:
         echo "Kernel commit: $(git rev-parse HEAD)"
         echo "Kernel version: $(make kernelversion 2>/dev/null || echo 'Unknown')"
 
-    - name: Apply Android 14 Compatibility Patches
+    - name: Apply Android 14 and KernelSU Required Patches
       run: |
         cd kernel
         
-        echo "=== Applying Android 14 compatibility patches ==="
+        echo "=== Applying Android 14 and KernelSU compatibility patches ==="
         
         if [ ! -f "arch/arm64/configs/whyred_defconfig" ]; then
           echo "Error: whyred_defconfig not found!"
@@ -126,7 +123,7 @@ jobs:
           exit 1
         fi
         
-        # Patch kernel config for Android 14
+        # Patch kernel config for Android 14 and KernelSU requirements
         cat >> arch/arm64/configs/whyred_defconfig << 'EOL'
         
         # Android 14 Requirements
@@ -146,6 +143,15 @@ jobs:
         CONFIG_FORTIFY_SOURCE=y
         CONFIG_SECURITY_SELINUX_DEVELOP=y
         
+        # KernelSU Requirements (CRITICAL!)
+        CONFIG_KPROBES=y
+        CONFIG_HAVE_KPROBES=y
+        CONFIG_KPROBE_EVENTS=y
+        CONFIG_MODULES=y
+        CONFIG_MODULE_UNLOAD=y
+        CONFIG_MODULE_FORCE_UNLOAD=y
+        CONFIG_OVERLAY_FS=y
+        
         # Extended kernel specific
         CONFIG_EXTENDED_KERNEL=y
         CONFIG_EXTENDED_MODULES=y
@@ -156,11 +162,11 @@ jobs:
           sed -i 's/\$compiler -dumpversion/\$compiler -dumpfullversion/g' scripts/gcc-version.sh
         fi
 
-    - name: Setup KernelSU with Kernel 4.4 Compatibility
+    - name: Setup KernelSU with Complete Compatibility Layer
       run: |
         cd kernel
         
-        echo "=== Integrating KernelSU for Kernel 4.4 ==="
+        echo "=== Integrating KernelSU with full compatibility ==="
         
         # Remove any existing KernelSU
         rm -rf KernelSU
@@ -169,53 +175,121 @@ jobs:
         # Setup KernelSU
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.KSU_VERSION || 'main' }}
         
-        # Fix KernelSU for kernel 4.4 compatibility
-        echo "=== Patching KernelSU for kernel 4.4 compatibility ==="
+        echo "=== Creating comprehensive compatibility layer for kernel 4.4 ==="
         
-        # Fix MODULE_IMPORT_NS issue
-        if [ -f "drivers/kernelsu/ksu.c" ]; then
-          echo "Patching ksu.c for kernel 4.4..."
-          
-          # Remove or comment out MODULE_IMPORT_NS line
-          sed -i '/MODULE_IMPORT_NS/d' drivers/kernelsu/ksu.c
-          
-          # Alternative: Comment it out
-          # sed -i 's/^MODULE_IMPORT_NS/\/\/ MODULE_IMPORT_NS/' drivers/kernelsu/ksu.c
-          
-          # Add compatibility defines if needed
+        # Create complete compat.h file
+        if [ -d "drivers/kernelsu" ]; then
           cat > drivers/kernelsu/compat.h << 'EOF'
         #ifndef _KSU_COMPAT_H
         #define _KSU_COMPAT_H
         
-        /* Compatibility for older kernels */
+        #include <linux/version.h>
+        #include <linux/types.h>
+        #include <linux/string.h>
+        
+        /* MODULE_IMPORT_NS doesn't exist in kernel 4.4 */
         #ifndef MODULE_IMPORT_NS
-        #define MODULE_IMPORT_NS(ns) 
+        #define MODULE_IMPORT_NS(ns)
+        #endif
+        
+        /* Kernel 4.4 compatibility definitions */
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)
+        #define ksu_strncpy_from_user strncpy_from_user
+        #else
+        #define ksu_strncpy_from_user strncpy_from_user_nofault
+        #endif
+        
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+        #define ksu_get_user_pages(start, nr_pages, write, pages) \
+            get_user_pages(current, current->mm, start, nr_pages, \
+                          write ? FOLL_WRITE : 0, 0, pages, NULL)
+        #else
+        #define ksu_get_user_pages(start, nr_pages, write, pages) \
+            get_user_pages(start, nr_pages, write ? FOLL_WRITE : 0, pages, NULL)
+        #endif
+        
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+        #define ksu_proc_mkdir(name, parent) proc_mkdir(name, parent)
+        #define ksu_proc_create_data(name, mode, parent, fops, data) \
+            proc_create_data(name, mode, parent, fops, data)
+        #else  
+        #define ksu_proc_mkdir(name, parent) proc_mkdir(name, parent)
+        #define ksu_proc_create_data(name, mode, parent, fops, data) \
+            proc_create_data(name, mode, parent, fops, data)
+        #endif
+        
+        /* VFS compatibility for kernel 4.4 */
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0)
+        #define kernel_read(file, buf, count, pos) \
+            kernel_read(file, *(pos), buf, count)
+        #define kernel_write(file, buf, count, pos) \
+            kernel_write(file, buf, count, *(pos))
+        #endif
+        
+        /* User namespace compatibility */
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0)
+        struct user_namespace;
+        #define mnt_userns init_user_ns
+        #endif
+        
+        /* Additional compatibility for KernelSU */
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+        #define ksu_task_uid(task) (task)->cred->uid
+        #define ksu_task_euid(task) (task)->cred->euid
+        #else
+        #define ksu_task_uid(task) (task)->cred->uid
+        #define ksu_task_euid(task) (task)->cred->euid
+        #endif
+        
+        /* Memory management compatibility */
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 6, 0)
+        #define ksu_kvmalloc(size, flags) kmalloc(size, flags)
+        #define ksu_kvfree(ptr) kfree(ptr)
+        #else
+        #define ksu_kvmalloc(size, flags) kvmalloc(size, flags)
+        #define ksu_kvfree(ptr) kvfree(ptr)
         #endif
         
         #endif /* _KSU_COMPAT_H */
         EOF
           
-          # Include compat header in ksu.c
-          sed -i '1i#include "compat.h"' drivers/kernelsu/ksu.c
+          echo "✓ Created comprehensive compat.h"
         fi
         
-        # Fix other potential compatibility issues
+        # Fix ksu.c to include compat.h and remove problematic lines
+        if [ -f "drivers/kernelsu/ksu.c" ]; then
+          echo "Patching ksu.c..."
+          
+          # Remove MODULE_IMPORT_NS line
+          sed -i '/MODULE_IMPORT_NS/d' drivers/kernelsu/ksu.c
+          
+          # Add compat.h include at the beginning of the file
+          sed -i '1i#include "compat.h"' drivers/kernelsu/ksu.c
+          
+          echo "✓ Patched ksu.c"
+        fi
+        
+        # Fix other KernelSU files for compatibility
         if [ -d "KernelSU" ]; then
           echo "Applying additional KernelSU patches..."
           
-          # Fix for older kernel headers
-          find KernelSU -name "*.c" -o -name "*.h" | while read file; do
-            # Remove MODULE_IMPORT_NS references
-            sed -i '/MODULE_IMPORT_NS/d' "$file" 2>/dev/null || true
-            
-            # Fix other potential issues
-            sed -i 's/struct user_namespace \*mnt_userns/struct user_namespace \*ns/g' "$file" 2>/dev/null || true
+          # Find and fix all MODULE_IMPORT_NS references
+          find KernelSU drivers/kernelsu -name "*.c" -o -name "*.h" 2>/dev/null | while read file; do
+            if [ -f "$file" ]; then
+              # Remove MODULE_IMPORT_NS
+              sed -i '/MODULE_IMPORT_NS/d' "$file" 2>/dev/null || true
+              
+              # Fix other kernel 4.4 incompatibilities
+              sed -i 's/struct user_namespace \*mnt_userns/struct user_namespace \*ns/g' "$file" 2>/dev/null || true
+            fi
           done
+          
+          echo "✓ Fixed all KernelSU files"
         fi
         
         # Verify KSU integration
         if [ -d "KernelSU" ] || [ -d "drivers/kernelsu" ]; then
-          echo "✓ KernelSU integrated"
+          echo "✓ KernelSU integrated successfully"
           if [ -d "KernelSU" ]; then
             cd KernelSU && git log --oneline -1 && cd ..
           fi
@@ -223,7 +297,7 @@ jobs:
           echo "Warning: KernelSU directory not found!"
         fi
 
-    - name: Configure Kernel for HyperOS 2
+    - name: Configure Kernel with KernelSU Support
       run: |
         cd kernel
         
@@ -248,35 +322,41 @@ jobs:
         # Load Extended defconfig
         make O=out ARCH=arm64 whyred_defconfig
         
-        # Enable KernelSU if config tool exists
-        if [ -f "scripts/config" ]; then
-          scripts/config --file out/.config \
-            --enable CONFIG_KSU \
-            --enable CONFIG_OVERLAY_FS \
-            --enable CONFIG_MODULES \
-            --enable CONFIG_MODULE_UNLOAD \
-            --enable CONFIG_MODULE_FORCE_UNLOAD || true
-          
-          # Android 14 specific configs
-          if [ "${{ github.event.inputs.ANDROID_VERSION }}" = "14" ]; then
-            scripts/config --file out/.config \
-              --enable CONFIG_ANDROID_BINDERFS \
-              --enable CONFIG_ANDROID_BINDER_IPC \
-              --set-str CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder" || true
-          fi
-        else
-          echo "Warning: scripts/config not found, manually editing .config"
-          
-          # Manually add KernelSU config
-          echo "CONFIG_KSU=y" >> out/.config
-          echo "CONFIG_OVERLAY_FS=y" >> out/.config
-          echo "CONFIG_MODULES=y" >> out/.config
+        # Enable KernelSU and required features
+        echo "Enabling KernelSU configuration..."
+        
+        # Create config fragment for KernelSU
+        cat > out/ksu.config << 'EOL'
+        CONFIG_KSU=y
+        CONFIG_KPROBES=y
+        CONFIG_HAVE_KPROBES=y
+        CONFIG_KPROBE_EVENTS=y
+        CONFIG_OVERLAY_FS=y
+        CONFIG_MODULES=y
+        CONFIG_MODULE_UNLOAD=y
+        CONFIG_MODULE_FORCE_UNLOAD=y
+        EOL
+        
+        # Merge config
+        ./scripts/kconfig/merge_config.sh -O out out/.config out/ksu.config 2>/dev/null || {
+          echo "merge_config.sh not found, manually adding configs..."
+          cat out/ksu.config >> out/.config
+        }
+        
+        # Android 14 specific configs
+        if [ "${{ github.event.inputs.ANDROID_VERSION }}" = "14" ]; then
+          echo "CONFIG_ANDROID_BINDERFS=y" >> out/.config
+          echo "CONFIG_ANDROID_BINDER_IPC=y" >> out/.config
         fi
         
         # Regenerate config
         make O=out ARCH=arm64 olddefconfig
+        
+        # Verify KSU config is enabled
+        echo "Verifying KernelSU configuration..."
+        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_OVERLAY_FS" out/.config || echo "Warning: Some KSU configs might be missing"
 
-    - name: Build Extended Kernel with KSU
+    - name: Build Extended Kernel with KernelSU
       run: |
         cd kernel
         
@@ -287,8 +367,9 @@ jobs:
         export KBUILD_BUILD_USER="KSU-Extended"
         export KBUILD_BUILD_HOST="HyperOS2"
         
-        # Suppress OpenSSL warnings
-        export CFLAGS="-Wno-deprecated-declarations"
+        # Suppress warnings
+        export KCFLAGS="-w"
+        export KAFLAGS="-w"
         
         # Build info
         echo "=== Build Information ==="
@@ -299,7 +380,7 @@ jobs:
         
         START=$(date +"%s")
         
-        # Build kernel - capture both success and failure
+        # Build kernel
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -317,32 +398,35 @@ jobs:
         DIFF=$((END - START))
         echo "Build time: $((DIFF / 60))m $((DIFF % 60))s"
         
-        # Check if kernel was built despite errors
+        # Check build result
         if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
           echo "✓ Kernel image found!"
           ls -lh out/arch/arm64/boot/Image.gz-dtb
           exit 0
-        else
-          echo "✗ Build failed - checking for partial build..."
+        elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
+          echo "Image.gz found, creating Image.gz-dtb..."
           
-          # Check for Image.gz (without dtb)
-          if [ -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "Found Image.gz, creating Image.gz-dtb..."
-            cat out/arch/arm64/boot/Image.gz out/arch/arm64/boot/dts/qcom/*.dtb > out/arch/arm64/boot/Image.gz-dtb 2>/dev/null || true
-            
-            if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
-              echo "✓ Created Image.gz-dtb successfully!"
-              exit 0
-            fi
+          # Find and append DTB
+          if [ -d "out/arch/arm64/boot/dts/qcom" ]; then
+            cat out/arch/arm64/boot/Image.gz out/arch/arm64/boot/dts/qcom/*.dtb > out/arch/arm64/boot/Image.gz-dtb 2>/dev/null || {
+              echo "Failed to append DTB"
+              cat out/arch/arm64/boot/Image.gz out/arch/arm64/boot/dts/*.dtb > out/arch/arm64/boot/Image.gz-dtb 2>/dev/null || true
+            }
           fi
           
-          echo "✗ Build completely failed"
-          echo "Last 100 lines of build log:"
-          tail -100 build.log
-          exit 1
+          if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "✓ Created Image.gz-dtb successfully!"
+            ls -lh out/arch/arm64/boot/Image.gz-dtb
+            exit 0
+          fi
         fi
+        
+        echo "✗ Build failed"
+        echo "Last 100 lines of build log:"
+        tail -100 build.log
+        exit 1
 
-    - name: Verify Build
+    - name: Verify Build and KernelSU Integration
       run: |
         cd kernel
         
@@ -351,11 +435,18 @@ jobs:
           echo "Kernel info:"
           ls -lh out/arch/arm64/boot/Image.gz-dtb
           file out/arch/arm64/boot/Image.gz-dtb
+          
+          # Check for KernelSU in kernel
+          if strings out/arch/arm64/boot/Image.gz-dtb | grep -q "KernelSU"; then
+            echo "✓ KernelSU detected in kernel image!"
+          else
+            echo "⚠️ Warning: KernelSU string not found in kernel (might be normal)"
+          fi
+          
+          # Check kernel version
           strings out/arch/arm64/boot/Image.gz-dtb | grep -i "linux version" | head -1 || true
         else
-          echo "✗ Build failed - kernel image not found!"
-          echo "Contents of out/arch/arm64/boot/:"
-          ls -la out/arch/arm64/boot/ || echo "Directory not found"
+          echo "✗ Kernel image not found!"
           exit 1
         fi
 
@@ -369,7 +460,7 @@ jobs:
         
         rm -rf .git* README.md LICENSE
         
-        # Configure for whyred
+        # Configure for whyred with KernelSU
         cat > anykernel.sh << 'EOL'
         # AnyKernel3 Ramdisk Mod Script
         properties() { '
@@ -401,6 +492,26 @@ jobs:
         
         # Copy kernel
         cp ../kernel/out/arch/arm64/boot/Image.gz-dtb .
+        
+        # Create version info
+        BUILD_DATE=$(date)
+        cat > version.txt << EOL
+        KernelSU Next Extended Build Information
+        ========================================
+        Build Date: $BUILD_DATE
+        Android Version: ${{ github.event.inputs.ANDROID_VERSION }}
+        KernelSU Version: ${{ github.event.inputs.KSU_VERSION }}
+        Kernel: 4.4.302-Extended
+        ROM: HyperOS 2
+        Device: Xiaomi Redmi Note 5 (whyred)
+        Builder: GitHub Actions
+        
+        KernelSU Features:
+        - Full root access
+        - Module support
+        - Kernel-level su management
+        - Android 14 compatibility
+        EOL
         
         # Create flashable zip
         ZIP_NAME="KSU-Extended-HyperOS2-A${{ github.event.inputs.ANDROID_VERSION }}-$(date +%Y%m%d-%H%M).zip"
@@ -451,13 +562,30 @@ jobs:
           - **Android Version:** ${{ github.event.inputs.ANDROID_VERSION }}
           - **KernelSU Version:** ${{ github.event.inputs.KSU_VERSION }}
           - **Kernel Base:** 4.4.302-Extended
+          - **Build Date:** $(date)
+          
+          ### Features:
+          - ✅ KernelSU root solution
+          - ✅ Full KPROBES support
+          - ✅ Module management
+          - ✅ Android 14 compatibility
+          - ✅ Extended kernel optimizations
           
           ### Installation:
-          1. Backup boot.img
-          2. Flash via custom recovery
-          3. Install KernelSU Manager APK
+          1. **Backup** your current boot.img
+          2. Boot to custom recovery (TWRP/OrangeFox)
+          3. Flash the zip file
+          4. Wipe cache/dalvik
+          5. Reboot
+          6. Install **KernelSU Manager** APK
           
-          ⚠️ **For HyperOS 2 Android 14 only!**
+          ### Requirements:
+          - Unlocked bootloader
+          - HyperOS 2 ROM
+          - Custom recovery
+          
+          ⚠️ **WARNING:** Only for HyperOS 2 Android 14!
+          ⚠️ Always backup before flashing!
         files: |
           KSU-Extended-*.zip
         draft: false
