@@ -355,28 +355,38 @@ jobs:
         echo "✓ Flashable zip created!"
         ls -lh *.zip
 
+    # UPDATED TO V4 - FIX FOR DEPRECATED ERROR
     - name: Upload Kernel Image
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: Extended-Kernel-Image
         path: kernel/out/arch/arm64/boot/Image.gz-dtb
+        compression-level: 9
+        retention-days: 30
 
+    # UPDATED TO V4
     - name: Upload Flashable Zip
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: KSU-Next-Extended-HyperOS2
         path: KSU-Next-Extended-*.zip
+        compression-level: 9
+        retention-days: 30
 
+    # UPDATED TO V4
     - name: Upload Build Log
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: Build-Log
         path: kernel/build.log
+        compression-level: 9
+        retention-days: 7
 
+    # UPDATED TO V2
     - name: Create Release
       if: success()
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         tag_name: KSU-Extended-A${{ github.event.inputs.ANDROID_VERSION }}-${{ github.run_number }}
         name: KernelSU Next Extended for HyperOS 2 - Build ${{ github.run_number }}
