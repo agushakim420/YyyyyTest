@@ -31,7 +31,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04  # CHANGED: Use Ubuntu 22.04 for better compatibility
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
     
     permissions:
@@ -42,6 +42,17 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+
+    - name: Clean Workspace
+      run: |
+        echo "=== Cleaning workspace ==="
+        # Remove any existing kernel directory
+        rm -rf kernel
+        rm -rf ~/toolchain
+        
+        # Clean up workspace
+        df -h
+        echo "Workspace cleaned"
 
     - name: Setup Build Environment
       run: |
@@ -80,10 +91,6 @@ jobs:
         echo "Downloading Proton Clang..."
         git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
         
-        # Alternative: AOSP Clang (if preferred)
-        # wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz -O clang.tar.gz
-        # mkdir clang && tar -xzf clang.tar.gz -C clang
-        
         # Get GCC for cross compile
         echo "Downloading GCC toolchains..."
         git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 gcc64
@@ -96,16 +103,38 @@ jobs:
     - name: Clone Extended Kernel Source
       run: |
         echo "=== Cloning Extended kernel source ==="
+        
+        # Make sure kernel directory doesn't exist
+        if [ -d "kernel" ]; then
+          echo "Removing existing kernel directory..."
+          rm -rf kernel
+        fi
+        
+        # Clone the kernel
         git clone --depth=1 https://github.com/fernandobouchet/Whyred -b extended kernel
+        
+        # Verify clone success
+        if [ ! -d "kernel" ]; then
+          echo "Failed to clone kernel!"
+          exit 1
+        fi
         
         cd kernel
         echo "Kernel commit: $(git rev-parse HEAD)"
+        echo "Kernel branch: $(git branch --show-current)"
 
     - name: Apply Android 14 Compatibility Patches
       run: |
         cd kernel
         
         echo "=== Applying Android 14 compatibility patches ==="
+        
+        # Check if defconfig exists
+        if [ ! -f "arch/arm64/configs/whyred_defconfig" ]; then
+          echo "Error: whyred_defconfig not found!"
+          ls -la arch/arm64/configs/
+          exit 1
+        fi
         
         # Patch 1: Update kernel config for Android 14
         cat >> arch/arm64/configs/whyred_defconfig << 'EOL'
@@ -145,6 +174,9 @@ jobs:
         
         echo "=== Integrating KernelSU Next for Extended kernel ==="
         
+        # Remove any existing KernelSU
+        rm -rf KernelSU
+        
         # Setup KernelSU Next
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.KSU_VERSION || 'next' }}
         
@@ -172,6 +204,8 @@ jobs:
         if [ -d "KernelSU" ]; then
           echo "KernelSU version:"
           cd KernelSU && git log --oneline -1 && cd ..
+        else
+          echo "Warning: KernelSU directory not found!"
         fi
 
     - name: Configure Kernel for HyperOS 2
@@ -187,27 +221,36 @@ jobs:
         
         # Clean if requested
         if [ "${{ github.event.inputs.CLEAN_BUILD }}" = "true" ]; then
-          make O=out clean || true
-          make O=out mrproper || true
+          echo "Performing clean build..."
+          rm -rf out
+          make clean || true
+          make mrproper || true
         fi
+        
+        # Create out directory
+        mkdir -p out
         
         # Load Extended defconfig
         make O=out ARCH=arm64 whyred_defconfig
         
-        # Enable KernelSU
-        scripts/config --file out/.config \
-          --enable CONFIG_KSU \
-          --enable CONFIG_OVERLAY_FS \
-          --enable CONFIG_MODULES \
-          --enable CONFIG_MODULE_UNLOAD \
-          --enable CONFIG_MODULE_FORCE_UNLOAD || true
-        
-        # Android 14 specific configs
-        if [ "${{ github.event.inputs.ANDROID_VERSION }}" = "14" ]; then
+        # Enable KernelSU if config tool exists
+        if [ -f "scripts/config" ]; then
           scripts/config --file out/.config \
-            --enable CONFIG_ANDROID_BINDERFS \
-            --enable CONFIG_ANDROID_BINDER_IPC \
-            --set-str CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder" || true
+            --enable CONFIG_KSU \
+            --enable CONFIG_OVERLAY_FS \
+            --enable CONFIG_MODULES \
+            --enable CONFIG_MODULE_UNLOAD \
+            --enable CONFIG_MODULE_FORCE_UNLOAD || true
+          
+          # Android 14 specific configs
+          if [ "${{ github.event.inputs.ANDROID_VERSION }}" = "14" ]; then
+            scripts/config --file out/.config \
+              --enable CONFIG_ANDROID_BINDERFS \
+              --enable CONFIG_ANDROID_BINDER_IPC \
+              --set-str CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder" || true
+          fi
+        else
+          echo "Warning: scripts/config not found, using default config"
         fi
         
         # Regenerate config
@@ -229,11 +272,12 @@ jobs:
         echo "Clang version: $(clang --version | head -1)"
         echo "Building for Android: ${{ github.event.inputs.ANDROID_VERSION }}"
         echo "KernelSU: ${{ github.event.inputs.KSU_VERSION }}"
+        echo "CPU cores: $(nproc)"
         
         START=$(date +"%s")
         
-        # Build kernel
-        make -j$(nproc --all) O=out \
+        # Build kernel with error handling
+        if make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -244,7 +288,15 @@ jobs:
           OBJCOPY=llvm-objcopy \
           OBJDUMP=llvm-objdump \
           STRIP=llvm-strip \
-          2>&1 | tee build.log
+          2>&1 | tee build.log; then
+          
+          echo "✓ Build completed successfully"
+        else
+          echo "✗ Build failed"
+          echo "Last 100 lines of build log:"
+          tail -100 build.log
+          exit 1
+        fi
         
         END=$(date +"%s")
         DIFF=$((END - START))
@@ -258,9 +310,12 @@ jobs:
           echo "✓ Kernel built successfully!"
           echo "Kernel info:"
           ls -lh out/arch/arm64/boot/Image.gz-dtb
-          strings out/arch/arm64/boot/Image.gz-dtb | grep -i "extended" | head -5 || true
+          file out/arch/arm64/boot/Image.gz-dtb
+          strings out/arch/arm64/boot/Image.gz-dtb | grep -i "linux version" | head -1 || true
         else
-          echo "✗ Build failed!"
+          echo "✗ Build failed - kernel image not found!"
+          echo "Contents of out/arch/arm64/boot/:"
+          ls -la out/arch/arm64/boot/ || echo "Directory not found"
           echo "Last 50 lines of build log:"
           tail -50 build.log
           exit 1
@@ -269,6 +324,9 @@ jobs:
     - name: Create AnyKernel3 Package for HyperOS 2
       run: |
         echo "=== Creating HyperOS 2 compatible flashable zip ==="
+        
+        # Clean any existing AnyKernel3
+        rm -rf AnyKernel3
         
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3
         cd AnyKernel3
@@ -322,40 +380,14 @@ jobs:
         ## End install
         EOL
         
-        # Create Extended patch script
-        cat > extended_patch.sh << 'EOL'
-        # Extended Kernel Compatibility Patches
-        # For HyperOS 2 Android 14
-        
-        # Preserve HyperOS specific properties
-        backup_file init.rc;
-        backup_file init.environ.rc;
-        
-        # Patch for Android 14 compatibility
-        if [ -f "$ramdisk/init.rc" ]; then
-          insert_line "$ramdisk/init.rc" "import /init.extended.rc" after "import /init.environ.rc" "import /init.extended.rc";
-        fi
-        
-        # Create extended init if not exists
-        if [ ! -f "$ramdisk/init.extended.rc" ]; then
-          cat > "$ramdisk/init.extended.rc" << 'INIT'
-        # Extended Kernel Init
-        on boot
-            # KernelSU Next
-            chmod 0755 /data/adb/ksu
-            
-        on property:sys.boot_completed=1
-            # Extended kernel optimizations
-            write /proc/sys/kernel/sched_boost 1
-        INIT
-        fi
-        EOL
-        
         # Copy kernel
-        cp ../kernel/out/arch/arm64/boot/Image.gz-dtb .
-        
-        # Copy DTB/DTBO if exists
-        [ -f "../kernel/out/arch/arm64/boot/dtbo.img" ] && cp ../kernel/out/arch/arm64/boot/dtbo.img . || true
+        if [ -f "../kernel/out/arch/arm64/boot/Image.gz-dtb" ]; then
+          cp ../kernel/out/arch/arm64/boot/Image.gz-dtb .
+          echo "Kernel image copied successfully"
+        else
+          echo "Error: Kernel image not found!"
+          exit 1
+        fi
         
         # Create version info
         BUILD_DATE=$(date)
@@ -372,10 +404,11 @@ jobs:
         EOL
         
         # Create flashable zip
-        zip -r9 "../KSU-Next-Extended-HyperOS2-A${{ github.event.inputs.ANDROID_VERSION }}-$(date +%Y%m%d).zip" * -x '*.git*'
+        ZIP_NAME="KSU-Next-Extended-HyperOS2-A${{ github.event.inputs.ANDROID_VERSION }}-$(date +%Y%m%d-%H%M).zip"
+        zip -r9 "../$ZIP_NAME" * -x '*.git*'
         
         cd ..
-        echo "✓ Flashable zip created!"
+        echo "✓ Flashable zip created: $ZIP_NAME"
         ls -lh *.zip
 
     - name: Upload Kernel Image
@@ -385,6 +418,7 @@ jobs:
         path: kernel/out/arch/arm64/boot/Image.gz-dtb
         compression-level: 9
         retention-days: 30
+        if-no-files-found: error
 
     - name: Upload Flashable Zip
       uses: actions/upload-artifact@v4
@@ -393,6 +427,7 @@ jobs:
         path: KSU-Next-Extended-*.zip
         compression-level: 9
         retention-days: 30
+        if-no-files-found: error
 
     - name: Upload Build Log
       if: always()
@@ -419,13 +454,6 @@ jobs:
           - **KernelSU Version:** ${{ github.event.inputs.KSU_VERSION }}
           - **Kernel Base:** 4.4.302-Extended
           - **ROM Compatibility:** HyperOS 2
-          - **Build Date:** ${{ github.event.workflow_run.created_at }}
-          
-          ### What's Included
-          - Extended Kernel features
-          - KernelSU Next root solution
-          - Android 14 compatibility patches
-          - HyperOS 2 optimizations
           
           ### Installation Guide
           1. **Requirements:**
@@ -449,12 +477,6 @@ jobs:
           ⚠️ **WARNING:** This kernel is specifically built for HyperOS 2 Android 14
           ⚠️ Do NOT flash on other ROMs or Android versions
           ⚠️ Always backup before flashing
-          
-          ### Troubleshooting
-          If bootloop occurs:
-          - Boot to recovery
-          - Restore boot.img backup
-          - Or reflash ROM
           
           **Support:** Create an issue if you encounter problems
         files: |
